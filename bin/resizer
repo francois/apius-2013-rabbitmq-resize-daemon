@@ -1,0 +1,89 @@
+#!/usr/bin/env ruby
+require "bundler/setup"
+Bundler.require(:default)
+
+require "tempfile"
+require "base64"
+require "logger"
+
+def logger
+  @logger ||=
+    begin
+      logger = Logger.new(STDERR)
+      logger.formatter = lambda {|severity, datetime, progname, msg|
+        "[#{"%-5s" % severity}] #{File.basename($0)}:#{Process.pid} - #{msg}\n"
+      }
+
+      logger
+    end
+end
+
+module CallNextOnUnbind
+  def initialize(block)
+    @block = block
+  end
+
+  def receive_data(data)
+    print data
+  end
+
+  def unbind
+    EM.next_tick(&@block)
+  end
+end
+
+default_url = "amqp://localhost/%2F"
+amqp_url = ENV["AMQP_URL"] || default_url
+
+logger.info "Image resize daemon ready to resize!"
+AMQP.start(amqp_url) do |connection|
+  # Consumer side
+  cchannel = AMQP::Channel.new(connection)
+  tasks = cchannel.direct("image.resize", durable: true)
+  queue = cchannel.queue("image.resize", durable: true)
+  cchannel.prefetch 2 # At most 2 messages at a time
+
+  # Producer side
+  pchannel = AMQP::Channel.new(connection)
+  results = pchannel.fanout("image.resized", durable: true)
+
+  queue.bind(tasks, routing_key: "jpg")
+  queue.bind(tasks, routing_key: "gif")
+  queue.bind(tasks, routing_key: "png")
+
+  queue.subscribe( ack: true ) do |meta, payload|
+    task = JSON.parse(payload)
+    logger.info "Received resize request: #{task.inspect}"
+
+    image_url = task.fetch("image_url")
+    input  = Tempfile.new("image-resize-daemon")
+    output = Tempfile.new("image-resize-daemon")
+
+    curl_cmd = %W[curl --silent --output #{input.path} #{image_url}]
+    curl     = Escape.shell_command curl_cmd
+    logger.debug curl
+
+    convert_cmd = %W[convert #{input.path} -resize 140x -strip #{output.path}]
+    convert     = Escape.shell_command convert_cmd
+    logger.debug convert
+
+    uploader = lambda do
+      bytes      = Base64.encode64(File.read(output.path))
+      payload    = task.merge(bytes: bytes).to_json
+      properties = {}
+
+      logger.info "Finished resizing #{task.inspect}, uploading #{payload.size} bytes..."
+      results.publish(payload, properties)
+
+      meta.ack
+    end
+
+    converter = lambda do
+      logger.info "Finished downloading #{task.inspect} (#{File.stat(input).size} bytes), resizing..."
+      EM.popen convert, CallNextOnUnbind, uploader
+    end
+
+    logger.info "Downloading #{task.inspect}"
+    EM.popen curl, CallNextOnUnbind, converter
+  end
+end
