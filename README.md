@@ -14,3 +14,8 @@ How to use, tweak and play
 4. cd apius-resize-daemon
 5. bundle
 6. bundle exec bin/resizer
+
+Interesting files
+-----------------
+
+There's one only interesting file: bin/resizer
